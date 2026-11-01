@@ -532,6 +532,11 @@ class BackendConfig:
             so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
             cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
             numerics are allclose to eager but not bitwise-identical.
+        reuse_sparse_attention_output_on_recompute: cuDNN DSA sparse-attention models (GLM-5.x): the
+            activation-checkpoint forward keeps the sparse-attention kernel output and log-sum-exp of
+            every layer so the backward recompute skips the forward kernel. Costs
+            ``[tokens, heads, 512]`` bf16 plus ``[tokens, heads]`` fp32 per layer per in-flight
+            microbatch (1 GB per layer at 16k tokens and 64 heads); gradients are unchanged. Default False.
         benchmark_static_routing: Benchmark-only. Requires ``fake_balanced_gate=True``
             with ``fake_gate_noise=0.0``, where routing metadata (tokens per expert,
             permuted token counts) is identical for every microbatch. Skips the
@@ -627,6 +632,10 @@ class BackendConfig:
     # all MoE expert modules), same lazy once-per-process pattern as compile_situ. Numerics
     # are allclose to eager, not bitwise-identical. Default False.
     compile_router_weight: bool = False
+    # cuDNN DSA models: record each layer's sparse-attention output in the checkpoint forward and
+    # replay it in the recompute instead of re-running the forward kernel ([tokens, heads, 512] bf16
+    # per layer per in-flight microbatch). Default False.
+    reuse_sparse_attention_output_on_recompute: bool = False
     # Benchmark-only: cache per-microbatch routing metadata (tokens per expert, permuted
     # token counts) after the first microbatch to remove recurring device-to-host syncs.
     # Valid ONLY with fake_balanced_gate=True and fake_gate_noise=0.0 (enforced in
@@ -1716,3 +1725,4 @@ __all__ = [
     "set_is_first_microbatch",
     "set_is_optim_step",
 ]
+

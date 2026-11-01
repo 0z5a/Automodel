@@ -38,7 +38,11 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     precompute_freqs_cis,
 )
 from nemo_automodel.components.models.glm_moe_dsa.cp import shard_glm_dsa_packed_cp_batch
-from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA, glm_dsa_indexer_replay
+from nemo_automodel.components.models.glm_moe_dsa.layers import (
+    GlmMoeDsaMLA,
+    glm_dsa_attention_replay,
+    glm_dsa_indexer_replay,
+)
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -61,6 +65,9 @@ class Block(nn.Module):
         # field (e.g. GLM-5.1, which runs a full indexer every layer), every layer is "full".
         indexer_types = getattr(config, "indexer_types", None)
         self.skip_topk = indexer_types is not None and indexer_types[layer_idx] == "shared"
+        # Opt-in: keep the cuDNN sparse-attention output of the checkpoint forward for the recompute
+        # (trades 1 GB per layer at 16k tokens for the forward kernel's recompute time).
+        self.reuse_attention_output = backend.reuse_sparse_attention_output_on_recompute
         self.self_attn = GlmMoeDsaMLA(config, backend, skip_topk=self.skip_topk)
 
         # Thread dtype from config.torch_dtype so the block's own params stay
@@ -91,22 +98,26 @@ class Block(nn.Module):
         self,
         context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
     ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
-        """Replay this block's DSA selection in its activation-checkpoint recompute.
+        """Replay this block's DSA selection, and optionally its attention output, in the recompute.
 
         The parallelizer composes this hook into the block's checkpoint context. A full indexer
         layer records its top-k indices in the checkpoint forward and returns them in the recompute
         (``GlmMoeDsaMLA._select_topk``); an IndexShare "shared" layer takes its indices from the
-        previous full layer and needs no replay.
+        previous full layer and needs no selection replay. With
+        ``BackendConfig.reuse_sparse_attention_output_on_recompute`` every layer also records the cuDNN
+        sparse-attention output and log-sum-exp so the recompute skips the forward attention kernel.
 
         Args:
             context_fn: Existing forward/recompute context factory, or ``None``.
 
         Returns:
-            The factory wrapped with selection replay for a full indexer layer, otherwise unchanged.
+            The factory wrapped with the replays this layer uses, or unchanged when it uses none.
         """
-        if self.skip_topk:
-            return context_fn
-        return glm_dsa_indexer_replay.checkpoint_context_fn(context_fn)
+        if not self.skip_topk:
+            context_fn = glm_dsa_indexer_replay.checkpoint_context_fn(context_fn)
+        if self.reuse_attention_output:
+            context_fn = glm_dsa_attention_replay.checkpoint_context_fn(context_fn)
+        return context_fn
 
     def forward(
         self,

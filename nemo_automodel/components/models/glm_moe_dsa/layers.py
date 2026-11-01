@@ -89,6 +89,12 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 # Record/replay channel for the frozen DSA selection across an activation-checkpoint recompute
 # (bound per checkpointed block call by ``Block.nemo_checkpoint_context_fn``).
 glm_dsa_indexer_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("GLM DSA frozen indexer selection")
+# Record/replay channel for the cuDNN sparse-attention output and log-sum-exp across an
+# activation-checkpoint recompute; opt-in through ``BackendConfig.reuse_sparse_attention_output_on_recompute``
+# and bound per checkpointed block call by ``Block.nemo_checkpoint_context_fn``.
+glm_dsa_attention_replay: RecomputeReplay[tuple[torch.Tensor, torch.Tensor]] = RecomputeReplay(
+    "GLM DSA sparse-attention output"
+)
 
 
 def _dsa_kernel_backend(backend: BackendConfig) -> str:
@@ -894,15 +900,33 @@ class GlmMoeDsaMLA(nn.Module):
                         "cuDNN DSA sparse attention requires fixed-width top-k indices of shape "
                         f"{expected_topk_shape}; got {tuple(topk_indices.shape)}."
                     )
-                latent_out = cudnn_sparse_attention(
-                    q_sparse,
-                    kv_latent,
-                    topk_indices,
-                    self.softmax_scale,
+                # Under ``reuse_sparse_attention_output_on_recompute`` the checkpoint forward records the
+                # kernel output and its log-sum-exp, and the recompute saves those for the backward instead
+                # of running the forward kernel again (1 GB per layer at 16k tokens for 64 heads).
+                replay = glm_dsa_attention_replay.current()
+                sparse_kwargs = dict(
                     topk_length=attn_kwargs.get("_cudnn_dsa_topk_length"),
                     all_rows_nonempty=bool(attn_kwargs.get("_cudnn_dsa_all_rows_nonempty", False)),
                     valid_row_indices=attn_kwargs.get("_cudnn_dsa_valid_row_indices"),
                 )
+                if replay is None:
+                    latent_out = cudnn_sparse_attention(
+                        q_sparse, kv_latent, topk_indices, self.softmax_scale, **sparse_kwargs
+                    )
+                else:
+                    recorder, mode = replay
+                    recorded = recorder.take() if mode == "replay" else None
+                    latent_out, lse = cudnn_sparse_attention(
+                        q_sparse,
+                        kv_latent,
+                        topk_indices,
+                        self.softmax_scale,
+                        return_lse=True,
+                        recorded=recorded,
+                        **sparse_kwargs,
+                    )
+                    if mode == "record":
+                        recorder.record((latent_out.detach(), lse.detach()))
                 attn_out = torch.einsum("thc,hdc->thd", latent_out, w_vc.to(latent_out.dtype))
             x = self.o_proj(attn_out.flatten(1))
             if return_topk_indices:

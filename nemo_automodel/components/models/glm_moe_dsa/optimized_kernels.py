@@ -205,7 +205,10 @@ def cudnn_sparse_attention(
     topk_length: torch.Tensor | None = None,
     all_rows_nonempty: bool = False,
     valid_row_indices: torch.Tensor | None = None,
-) -> torch.Tensor:
+    *,
+    return_lse: bool = False,
+    recorded: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run cuDNN DSA attention on packed latent Q/KV tensors.
 
     Args:
@@ -218,9 +221,13 @@ def cudnn_sparse_attention(
         topk_length: Optional int32 valid-prefix lengths of shape ``[tokens]``.
         all_rows_nonempty: Whether every query has a positive valid-prefix length.
         valid_row_indices: Optional cached int64 indices of nonempty query rows.
+        return_lse: Also return the FP32 log-sum-exp of shape ``[tokens, heads]``.
+        recorded: Optional ``(out, lse)`` of an earlier call on the same inputs, saved for the
+            backward instead of running the forward kernel (implies ``return_lse``).
 
     Returns:
-        CUDA bfloat16 latent-attention tensor of shape ``[tokens, heads, kv_lora_rank]``.
+        CUDA bfloat16 latent-attention tensor of shape ``[tokens, heads, kv_lora_rank]``, with
+        its log-sum-exp when ``return_lse`` or ``recorded`` is set.
     """
     return _cudnn_sparse_attention(
         q,
@@ -230,6 +237,8 @@ def cudnn_sparse_attention(
         topk_length=topk_length,
         all_rows_nonempty=all_rows_nonempty,
         valid_row_indices=valid_row_indices,
+        return_lse=return_lse,
+        recorded=recorded,
     )
 
 

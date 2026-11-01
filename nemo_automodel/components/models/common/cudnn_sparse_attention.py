@@ -177,6 +177,93 @@ def _pad_attention_heads(
     return q_padded, sink_padded
 
 
+def _sparse_attention_forward(
+    ctx: Any,
+    q: torch.Tensor,
+    kv_latent: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    padded_heads: int,
+    topk_length: torch.Tensor | None,
+    all_rows_nonempty: bool,
+    valid_row_indices: torch.Tensor | None,
+    attn_sink: torch.Tensor | None,
+    recorded: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run (or replay) the sparse forward and save the tensors the cuDNN backward needs.
+
+    Args:
+        ctx: Autograd context that receives the saved tensors and scalar metadata.
+        q: CUDA BF16 query tensor of shape ``[query_tokens, heads, head_dim]``.
+        kv_latent: CUDA BF16 latent K/V tensor of shape ``[key_tokens, 1, head_dim]``.
+        topk_indices: CUDA int32 tensor of shape ``[query_tokens, 1, sparse_width]`` with global
+            K/V coordinates and invalid entries marked ``-1``.
+        softmax_scale: Scale applied to query-key scores.
+        padded_heads: FlashMLA-compatible padded head count.
+        topk_length: Optional int32 valid-prefix lengths of shape ``[query_tokens]``.
+        all_rows_nonempty: Whether every query has a positive valid prefix.
+        valid_row_indices: Optional int64 indices of nonempty queries, shape ``[valid_query_tokens]``.
+        attn_sink: Optional FP32 per-head attention-sink logits of shape ``[heads]``; ``None`` disables the sink.
+        recorded: Optional ``(out, lse)`` from an earlier forward on the same inputs (an
+            activation-checkpoint recompute replaying its forward); when given, no kernel runs and
+            these tensors are saved for the backward instead.
+
+    Returns:
+        BF16 latent values of shape ``[query_tokens, heads, 512]`` and their FP32 log-sum-exp of
+        shape ``[query_tokens, heads]``.
+    """
+    kv = kv_latent.squeeze(1).contiguous()
+    if topk_length is None:
+        indices, topk_length = plan_sparse_indices(topk_indices.squeeze(1), kv.shape[0])
+    else:
+        indices = _pad_to_topk_alignment(topk_indices.squeeze(1).contiguous())
+
+    has_sink = attn_sink is not None
+    if attn_sink is None:
+        attn_sink = torch.full((q.shape[1],), float("-inf"), dtype=torch.float32, device=q.device)
+    attn_sink = attn_sink.detach().to(torch.float32).contiguous()
+    if recorded is not None:
+        out, lse = recorded
+    else:
+        q_kernel, sink_kernel = _pad_attention_heads(q.contiguous(), attn_sink, padded_heads)
+        if _HAS_FLASH_MLA:
+            out_kernel, _max_logits, lse_kernel = _FLASH_MLA_SPARSE_FWD(
+                q_kernel,
+                kv.unsqueeze(1),
+                indices.unsqueeze(1),
+                softmax_scale,
+                d_v=_VALUE_HEAD_DIM,
+                attn_sink=sink_kernel,
+                topk_length=topk_length,
+                indexer_topk=0,
+            )
+        else:
+            # cuDNN >= 1.29 sparse-prefill forward; same layouts as the backward wrapper (Q [S,H,D], KV [S_kv,D]).
+            fwd = _CUDNN_DSA.sparse_attention_forward_wrapper(
+                q_kernel,
+                kv,
+                indices,
+                attn_sink=sink_kernel,
+                topk_length=topk_length,
+                softmax_scale=softmax_scale,
+            )
+            out_kernel, lse_kernel = fwd["out"], fwd["lse"]
+        out = out_kernel[:, : q.shape[1]].contiguous()
+        lse = lse_kernel[:, : q.shape[1]].contiguous()
+        if not all_rows_nonempty:
+            out.masked_fill_(topk_length.eq(0).view(-1, 1, 1), 0)
+    cached_valid_rows = (
+        valid_row_indices if valid_row_indices is not None else torch.empty(0, dtype=torch.int64, device=q.device)
+    )
+    ctx.save_for_backward(q, kv, out, lse, attn_sink, indices.clamp_min(0), topk_length, cached_valid_rows)
+    ctx.softmax_scale = softmax_scale
+    ctx.padded_heads = padded_heads
+    ctx.all_rows_nonempty = all_rows_nonempty
+    ctx.has_cached_valid_rows = valid_row_indices is not None
+    ctx.has_sink = has_sink
+    return out, lse
+
+
 class _CudnnSparseAttention(torch.autograd.Function):
     """Pair FlashMLA forward with cuDNN backward for latent THD attention."""
 
@@ -213,52 +300,19 @@ class _CudnnSparseAttention(torch.autograd.Function):
         Returns:
             CUDA BF16 latent values of shape ``[query_tokens, heads, 512]``.
         """
-        kv = kv_latent.squeeze(1).contiguous()
-        if topk_length is None:
-            indices, topk_length = plan_sparse_indices(topk_indices.squeeze(1), kv.shape[0])
-        else:
-            indices = _pad_to_topk_alignment(topk_indices.squeeze(1).contiguous())
-
-        has_sink = attn_sink is not None
-        if attn_sink is None:
-            attn_sink = torch.full((q.shape[1],), float("-inf"), dtype=torch.float32, device=q.device)
-        attn_sink = attn_sink.detach().to(torch.float32).contiguous()
-        q_kernel, sink_kernel = _pad_attention_heads(q.contiguous(), attn_sink, padded_heads)
-        if _HAS_FLASH_MLA:
-            out_kernel, _max_logits, lse_kernel = _FLASH_MLA_SPARSE_FWD(
-                q_kernel,
-                kv.unsqueeze(1),
-                indices.unsqueeze(1),
-                softmax_scale,
-                d_v=_VALUE_HEAD_DIM,
-                attn_sink=sink_kernel,
-                topk_length=topk_length,
-                indexer_topk=0,
-            )
-        else:
-            # cuDNN >= 1.29 sparse-prefill forward; same layouts as the backward wrapper (Q [S,H,D], KV [S_kv,D]).
-            fwd = _CUDNN_DSA.sparse_attention_forward_wrapper(
-                q_kernel,
-                kv,
-                indices,
-                attn_sink=sink_kernel,
-                topk_length=topk_length,
-                softmax_scale=softmax_scale,
-            )
-            out_kernel, lse_kernel = fwd["out"], fwd["lse"]
-        out = out_kernel[:, : q.shape[1]].contiguous()
-        lse = lse_kernel[:, : q.shape[1]].contiguous()
-        if not all_rows_nonempty:
-            out.masked_fill_(topk_length.eq(0).view(-1, 1, 1), 0)
-        cached_valid_rows = (
-            valid_row_indices if valid_row_indices is not None else torch.empty(0, dtype=torch.int64, device=q.device)
+        out, _ = _sparse_attention_forward(
+            ctx,
+            q,
+            kv_latent,
+            topk_indices,
+            softmax_scale,
+            padded_heads,
+            topk_length,
+            all_rows_nonempty,
+            valid_row_indices,
+            attn_sink,
+            recorded=None,
         )
-        ctx.save_for_backward(q, kv, out, lse, attn_sink, indices.clamp_min(0), topk_length, cached_valid_rows)
-        ctx.softmax_scale = softmax_scale
-        ctx.padded_heads = padded_heads
-        ctx.all_rows_nonempty = all_rows_nonempty
-        ctx.has_cached_valid_rows = valid_row_indices is not None
-        ctx.has_sink = has_sink
         return out
 
     @staticmethod
@@ -350,6 +404,80 @@ class _CudnnSparseAttention(torch.autograd.Function):
         return grad_q, grad_kv, None, None, None, None, None, None, grad_sink
 
 
+class _CudnnSparseAttentionWithLse(torch.autograd.Function):
+    """``_CudnnSparseAttention`` that also returns the log-sum-exp and can replay a recorded forward."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        q: torch.Tensor,
+        kv_latent: torch.Tensor,
+        topk_indices: torch.Tensor,
+        softmax_scale: float,
+        padded_heads: int,
+        topk_length: torch.Tensor | None,
+        all_rows_nonempty: bool,
+        valid_row_indices: torch.Tensor | None,
+        attn_sink: torch.Tensor | None,
+        recorded_out: torch.Tensor | None,
+        recorded_lse: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the sparse forward, or save a recorded ``(out, lse)`` pair in its place.
+
+        Args:
+            ctx: Autograd context.
+            q: CUDA BF16 query tensor of shape ``[query_tokens, heads, head_dim]``.
+            kv_latent: CUDA BF16 latent K/V tensor of shape ``[key_tokens, 1, head_dim]``.
+            topk_indices: CUDA int32 tensor of shape ``[query_tokens, 1, sparse_width]``.
+            softmax_scale: Scale applied to query-key scores.
+            padded_heads: FlashMLA-compatible padded head count.
+            topk_length: Optional int32 valid-prefix lengths of shape ``[query_tokens]``.
+            all_rows_nonempty: Whether every query has a positive valid prefix.
+            valid_row_indices: Optional int64 indices of nonempty queries.
+            attn_sink: Optional FP32 per-head attention-sink logits of shape ``[heads]``.
+            recorded_out: Optional BF16 output of an earlier forward on the same inputs, shape
+                ``[query_tokens, heads, 512]``; given together with ``recorded_lse`` it replaces the kernel run.
+            recorded_lse: Optional FP32 log-sum-exp of that forward, shape ``[query_tokens, heads]``.
+
+        Returns:
+            The latent values and their log-sum-exp (not differentiable).
+        """
+        recorded = None
+        if recorded_out is not None:
+            if recorded_lse is None:
+                raise ValueError("recorded_lse must accompany recorded_out")
+            if recorded_out.shape != (q.shape[0], q.shape[1], _VALUE_HEAD_DIM) or recorded_lse.shape != q.shape[:2]:
+                raise ValueError(
+                    "recorded sparse-attention tensors do not match the query: "
+                    f"out {tuple(recorded_out.shape)}, lse {tuple(recorded_lse.shape)}, q {tuple(q.shape)}"
+                )
+            recorded = (recorded_out, recorded_lse)
+        out, lse = _sparse_attention_forward(
+            ctx,
+            q,
+            kv_latent,
+            topk_indices,
+            softmax_scale,
+            padded_heads,
+            topk_length,
+            all_rows_nonempty,
+            valid_row_indices,
+            attn_sink,
+            recorded=recorded,
+        )
+        if recorded is not None:
+            # Inputs returned as outputs are exposed through fresh views.
+            out, lse = out.view_as(out), lse.view_as(lse)
+        ctx.mark_non_differentiable(lse)
+        return out, lse
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor, grad_lse: torch.Tensor | None) -> tuple[torch.Tensor | None, ...]:
+        """Delegate to the cuDNN backward; the log-sum-exp and the recorded tensors receive no gradient."""
+        del grad_lse
+        return (*_CudnnSparseAttention.backward(ctx, grad_output), None, None)
+
+
 def cudnn_sparse_attention(
     q: torch.Tensor,
     kv_latent: torch.Tensor,
@@ -359,7 +487,10 @@ def cudnn_sparse_attention(
     all_rows_nonempty: bool = False,
     valid_row_indices: torch.Tensor | None = None,
     attn_sink: torch.Tensor | None = None,
-) -> torch.Tensor:
+    *,
+    return_lse: bool = False,
+    recorded: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run sparse latent attention with FlashMLA forward and cuDNN backward.
 
     Args:
@@ -379,10 +510,16 @@ def cudnn_sparse_attention(
             with shape ``[valid_query_tokens]``.
         attn_sink: Optional FP32 per-head attention-sink logits of shape ``[heads]``
             (DeepSeek-V4.1's learnable sink). Differentiable; ``None`` disables the sink.
+        return_lse: Also return the FP32 log-sum-exp of shape ``[query_tokens, heads]`` (not
+            differentiable), so a caller can record the forward for a later replay.
+        recorded: Optional ``(out, lse)`` recorded by an earlier call on the same inputs, for
+            example by the forward of an activation-checkpointed block whose recompute calls
+            again. No kernel runs; the recorded tensors are saved for the backward. Implies
+            ``return_lse``.
 
     Returns:
-        Contiguous CUDA BF16 latent output tensor of shape
-        ``[query_tokens, heads, 512]``.
+        Contiguous CUDA BF16 latent output tensor of shape ``[query_tokens, heads, 512]``, with
+        the log-sum-exp when ``return_lse`` or ``recorded`` is set.
 
     Raises:
         RuntimeError: If optional kernels, CUDA, or SM90+ are unavailable.
@@ -449,6 +586,21 @@ def cudnn_sparse_attention(
                 f"{(q.shape[1],)}, got shape={tuple(attn_sink.shape)}, dtype={attn_sink.dtype}, device={attn_sink.device}."
             )
         attn_sink = attn_sink.contiguous()
+    if return_lse or recorded is not None:
+        recorded_out, recorded_lse = recorded if recorded is not None else (None, None)
+        return _CudnnSparseAttentionWithLse.apply(
+            q.contiguous(),
+            kv_latent.contiguous(),
+            topk_indices.contiguous(),
+            float(softmax_scale),
+            padded_heads,
+            topk_length,
+            all_rows_nonempty,
+            valid_row_indices,
+            attn_sink,
+            recorded_out,
+            recorded_lse,
+        )
     return _CudnnSparseAttention.apply(
         q.contiguous(),
         kv_latent.contiguous(),
@@ -463,3 +615,4 @@ def cudnn_sparse_attention(
 
 
 __all__ = ["cudnn_sparse_attention", "is_cudnn_sparse_attention_available", "plan_sparse_indices"]
+

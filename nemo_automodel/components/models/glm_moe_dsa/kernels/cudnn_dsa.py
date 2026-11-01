@@ -569,7 +569,10 @@ def cudnn_sparse_attention(
     topk_length: torch.Tensor | None = None,
     all_rows_nonempty: bool = False,
     valid_row_indices: torch.Tensor | None = None,
-) -> torch.Tensor:
+    *,
+    return_lse: bool = False,
+    recorded: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run GLM-5.2 sparse MLA through the shared cuDNN adapter.
 
     Args:
@@ -586,10 +589,13 @@ def cudnn_sparse_attention(
         all_rows_nonempty: Whether every query has a positive valid-prefix length.
         valid_row_indices: Optional contiguous CUDA int64 indices of nonempty
             queries with shape ``[valid_query_tokens]``.
+        return_lse: Also return the FP32 log-sum-exp of shape ``[query_tokens, heads]``.
+        recorded: Optional ``(out, lse)`` of an earlier call on the same inputs, saved for the
+            backward instead of running the forward kernel (implies ``return_lse``).
 
     Returns:
-        Contiguous CUDA BF16 latent output tensor of shape
-        ``[query_tokens, heads, 512]``.
+        Contiguous CUDA BF16 latent output tensor of shape ``[query_tokens, heads, 512]``, with
+        its log-sum-exp when ``return_lse`` or ``recorded`` is set.
     """
     if q.ndim == 3 and q.shape[-1] != _ATTENTION_HEAD_DIM:
         raise ValueError(
@@ -609,6 +615,8 @@ def cudnn_sparse_attention(
         topk_length=topk_length,
         all_rows_nonempty=all_rows_nonempty,
         valid_row_indices=valid_row_indices,
+        return_lse=return_lse,
+        recorded=recorded,
     )
 
 
