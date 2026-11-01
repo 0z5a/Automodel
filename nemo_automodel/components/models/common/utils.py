@@ -537,6 +537,12 @@ class BackendConfig:
             every layer so the backward recompute skips the forward kernel. Costs
             ``[tokens, heads, 512]`` bf16 plus ``[tokens, heads]`` fp32 per layer per in-flight
             microbatch (1 GB per layer at 16k tokens and 64 heads); gradients are unchanged. Default False.
+        cp_query_layout: Which global query positions each context-parallel rank owns for models
+            whose attention gathers K/V inside the model (GLM-5.x DSA). ``"contiguous"`` (default):
+            rank r keeps tokens ``[r * T/cp, (r + 1) * T/cp)``. ``"head_tail"``: the sequence is cut
+            into ``2 * cp`` chunks and rank r keeps chunks r and ``2 * cp - 1 - r``, so the causal
+            (quadratic) indexer work is the same on every rank; the top-k sparse attention is uniform
+            per query either way. Needs the padded sequence divisible by ``2 * cp``.
         benchmark_static_routing: Benchmark-only. Requires ``fake_balanced_gate=True``
             with ``fake_gate_noise=0.0``, where routing metadata (tokens per expert,
             permuted token counts) is identical for every microbatch. Skips the
@@ -636,6 +642,9 @@ class BackendConfig:
     # replay it in the recompute instead of re-running the forward kernel ([tokens, heads, 512] bf16
     # per layer per in-flight microbatch). Default False.
     reuse_sparse_attention_output_on_recompute: bool = False
+    # Model-owned CP (GLM-5.x DSA): "contiguous" query shard per rank, or "head_tail" (rank r keeps
+    # chunks r and 2cp-1-r of 2cp) to balance the indexer's causal work. Default "contiguous".
+    cp_query_layout: Literal["contiguous", "head_tail"] = "contiguous"
     # Benchmark-only: cache per-microbatch routing metadata (tokens per expert, permuted
     # token counts) after the first microbatch to remove recurring device-to-host syncs.
     # Valid ONLY with fake_balanced_gate=True and fake_gate_noise=0.0 (enforced in
@@ -655,6 +664,10 @@ class BackendConfig:
 
         if self.sparse_attn not in ("generic", "msa"):
             raise ValueError(f"Unsupported sparse_attn={self.sparse_attn!r}; expected 'generic' or 'msa'.")
+        if self.cp_query_layout not in ("contiguous", "head_tail"):
+            raise ValueError(
+                f"Unsupported cp_query_layout={self.cp_query_layout!r}; expected 'contiguous' or 'head_tail'."
+            )
 
         # QuACK consumes position-gathered cosine/sine tables. TE's fused RoPE path
         # instead assumes contiguous [0, seq_len) positions, so combining the two
