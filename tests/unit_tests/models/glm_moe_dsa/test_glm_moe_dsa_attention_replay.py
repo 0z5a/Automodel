@@ -156,10 +156,13 @@ def test_recompute_reuses_recorded_attention_output(monkeypatch):
         torch.testing.assert_close(grad, ref_grads[name], msg=lambda m, n=name: f"{n}: {m}")
 
 
-def test_flag_off_keeps_recompute_and_shared_layer_hook_identity():
-    model = _model(reuse_attention_output=False)
-    assert model.model.layers["1"].skip_topk
-    sentinel = object()
-    assert model.model.layers["1"].nemo_checkpoint_context_fn(sentinel) is sentinel
-    flagged = _model(reuse_attention_output=True)
-    assert flagged.model.layers["1"].nemo_checkpoint_context_fn(sentinel) is not sentinel
+def test_flag_controls_whether_the_attention_replay_is_bound():
+    from nemo_automodel.components.models.glm_moe_dsa.layers import glm_dsa_attention_replay
+
+    for flag in (False, True):
+        block = _model(reuse_attention_output=flag).model.layers["1"]
+        assert block.skip_topk
+        forward_ctx, _ = block.nemo_checkpoint_context_fn(None)()
+        with forward_ctx:
+            assert (glm_dsa_attention_replay.current() is not None) is flag
+        assert glm_dsa_attention_replay.current() is None

@@ -37,7 +37,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.glm_moe_dsa.cp import shard_glm_dsa_packed_cp_batch
+from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_gather_replay, shard_glm_dsa_packed_cp_batch
 from nemo_automodel.components.models.glm_moe_dsa.layers import (
     GlmMoeDsaMLA,
     glm_dsa_attention_replay,
@@ -103,7 +103,8 @@ class Block(nn.Module):
         The parallelizer composes this hook into the block's checkpoint context. A full indexer
         layer records its top-k indices in the checkpoint forward and returns them in the recompute
         (``GlmMoeDsaMLA._select_topk``); an IndexShare "shared" layer takes its indices from the
-        previous full layer and needs no selection replay. With
+        previous full layer and needs no selection replay. Under context parallelism every layer
+        records its all-gathered latent K/V so the recompute does not communicate again. With
         ``BackendConfig.reuse_sparse_attention_output_on_recompute`` every layer also records the cuDNN
         sparse-attention output and log-sum-exp so the recompute skips the forward attention kernel.
 
@@ -111,10 +112,11 @@ class Block(nn.Module):
             context_fn: Existing forward/recompute context factory, or ``None``.
 
         Returns:
-            The factory wrapped with the replays this layer uses, or unchanged when it uses none.
+            The factory wrapped with the replays this layer uses.
         """
         if not self.skip_topk:
             context_fn = glm_dsa_indexer_replay.checkpoint_context_fn(context_fn)
+        context_fn = glm_dsa_gather_replay.checkpoint_context_fn(context_fn)
         if self.reuse_attention_output:
             context_fn = glm_dsa_attention_replay.checkpoint_context_fn(context_fn)
         return context_fn
